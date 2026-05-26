@@ -238,6 +238,10 @@ class LogFooter(Widget):
         if self.is_mounted:
             try:
                 log_lines = self.parent.query_one("LogLines")
+                if log_lines.scan_percentage is not None:
+                    percent = int(log_lines.scan_percentage * 100)
+                    meta.append(f"Scanning… {percent}%")
+
                 rate = log_lines.get_lines_per_second()
                 if rate > 0:
                     if rate.is_integer():
@@ -303,7 +307,7 @@ class LogView(Horizontal):
     show_find: reactive[bool] = reactive(False)
     show_panel: reactive[bool] = reactive(False)
     show_line_numbers: reactive[bool] = reactive(False)
-    tail: reactive[bool] = reactive(False)
+    tail: reactive[bool] = reactive(True)
     can_tail: reactive[bool] = reactive(True)
 
     def __init__(
@@ -423,18 +427,13 @@ class LogView(Horizontal):
     @on(ScanProgress)
     def on_scan_progress(self, event: ScanProgress):
         event.stop()
-        scan_progress_bar = self.query_one(ScanProgressBar)
-        scan_progress_bar.message = event.message
-        scan_progress_bar.complete = event.complete
 
     @on(ScanComplete)
     async def on_scan_complete(self, event: ScanComplete) -> None:
-        self.query_one(ScanProgressBar).remove()
         log_lines = self.query_one(LogLines)
         log_lines.loading = False
         self.query_one("LogLines").remove_class("-scanning")
         self.post_message(PointerMoved(log_lines.pointer_line))
-        self.tail = True
 
         footer = self.query_one(LogFooter)
         footer.call_after_refresh(footer.mount_keys)

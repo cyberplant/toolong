@@ -224,6 +224,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._merge_lines: list[tuple[float, int, LogFile]] | None = None
         self._lock = RLock()
         self._addition_history: list[tuple[float, int]] = []
+        self.scan_percentage: float | None = 0.0
 
     @property
     def log_file(self) -> LogFile:
@@ -246,7 +247,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         return self.can_focus and self.visible and not self._self_or_ancestors_disabled
 
     def compose(self) -> ComposeResult:
-        yield ScanProgressBar()
+        yield from ()
 
     def clear_caches(self) -> None:
         self._line_cache.clear()
@@ -265,7 +266,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         return pointer_line
 
     def on_mount(self) -> None:
-        self.loading = True
+        self.loading = False
         self.add_class("-scanning")
         self._line_reader.start()
         self.initial_scan_worker = self.run_scan(self.app.save_merge)
@@ -1002,6 +1003,7 @@ class LogLines(ScrollView, inherit_bindings=False):
     def on_scan_complete(self, event: ScanComplete) -> None:
         self._scanned_size = max(self._scanned_size, event.size)
         self._scan_start = event.scan_start
+        self.scan_percentage = None
         self.update_line_count()
         self.refresh()
         if len(self.log_files) == 1 and self.can_tail:
@@ -1011,6 +1013,7 @@ class LogLines(ScrollView, inherit_bindings=False):
     def on_scan_progress(self, event: ScanProgress):
         if event.scan_start is not None:
             self._scan_start = event.scan_start
+        self.scan_percentage = event.complete
 
     @on(LineRead)
     def on_line_read(self, event: LineRead) -> None:
