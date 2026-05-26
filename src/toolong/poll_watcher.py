@@ -16,17 +16,22 @@ class PollWatcher(WatcherBase):
 
         while not self._exit_event.is_set():
             successful_read = False
-            for fileno, watched_file in self._file_descriptors.items():
+            # Iterate over the dedicated watch file descriptors (not the reader's)
+            for watch_fileno, watched_file in list(self._watched_files.items()):
                 try:
-                    position = lseek(fileno, 0, SEEK_CUR)
-                    if chunk := read(fileno, chunk_size):
+                    position = lseek(watch_fileno, 0, SEEK_CUR)
+                    if chunk := read(watch_fileno, chunk_size):
                         successful_read = True
                         breaks = scan_chunk(chunk, position)
                         watched_file.callback(position + len(chunk), breaks)
                         position += len(chunk)
                 except Exception as error:
                     watched_file.error_callback(error)
-                    self._file_descriptors.pop(fileno, None)
+                    self._watched_files.pop(watch_fileno, None)
+                    try:
+                        watched_file.watch_file.close()
+                    except OSError:
+                        pass
                     break
             else:
                 if not successful_read:
