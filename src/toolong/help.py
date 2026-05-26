@@ -1,5 +1,11 @@
 import webbrowser
-from importlib.metadata import version
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("toolong")
+except PackageNotFoundError:
+    __version__ = "dev"
+
 
 from rich.text import Text
 
@@ -105,7 +111,7 @@ TITLE = rf"""
    | | (_) | (_) | |___| (_) | | | | (_| |
    |_|\___/ \___/|______\___/|_| |_|\__, |
                                      __/ |
-   Moving at Terminal velocity      |___/  v{version('toolong')}
+    Moving at Terminal velocity      |___/  v{__version__}
 
 """
 

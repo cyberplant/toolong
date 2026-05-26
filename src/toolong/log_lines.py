@@ -223,6 +223,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._line_reader = LineReader(self)
         self._merge_lines: list[tuple[float, int, LogFile]] | None = None
         self._lock = RLock()
+        self._addition_history: list[tuple[float, int]] = []
 
     @property
     def log_file(self) -> LogFile:
@@ -864,8 +865,9 @@ class LogLines(ScrollView, inherit_bindings=False):
         else:
             self.post_message(DismissOverlay())
 
-    # @work(thread=True)
+    @work(thread=True)
     def action_navigate(self, steps: int, unit: Literal["m", "h", "d"]) -> None:
+        worker = get_current_worker()
         initial_line_no = line_no = (
             self.scroll_offset.y if self.pointer_line is None else self.pointer_line
         )
@@ -889,22 +891,49 @@ class LogLines(ScrollView, inherit_bindings=False):
         elif unit == "d":
             target_timestamp = timestamp + timedelta(hours=steps * 24)
 
-        if direction == +1:
-            line_count = self.line_count
-            while line_no < line_count:
-                timestamp = self.get_timestamp(line_no)
-                if timestamp is not None and timestamp >= target_timestamp:
-                    break
-                line_no += 1
-        else:
-            while line_no > 0:
-                timestamp = self.get_timestamp(line_no)
-                if timestamp is not None and timestamp <= target_timestamp:
-                    break
-                line_no -= 1
+        start_time = time.monotonic()
+        dialog_shown = False
+        seeking_screen = None
 
-        self.pointer_line = line_no
-        self.scroll_pointer_to_center(animate=abs(initial_line_no - line_no) < 100)
+        try:
+            if direction == +1:
+                line_count = self.line_count
+                while line_no < line_count:
+                    if worker.is_cancelled:
+                        return
+                    if not dialog_shown and (time.monotonic() - start_time) > 5.0:
+                        dialog_shown = True
+                        from toolong.seeking_screen import SeekingScreen
+                        seeking_screen = SeekingScreen(worker)
+                        self.app.call_from_thread(self.app.push_screen, seeking_screen)
+
+                    timestamp = self.get_timestamp(line_no)
+                    if timestamp is not None and timestamp >= target_timestamp:
+                        break
+                    line_no += 1
+            else:
+                while line_no > 0:
+                    if worker.is_cancelled:
+                        return
+                    if not dialog_shown and (time.monotonic() - start_time) > 5.0:
+                        dialog_shown = True
+                        from toolong.seeking_screen import SeekingScreen
+                        seeking_screen = SeekingScreen(worker)
+                        self.app.call_from_thread(self.app.push_screen, seeking_screen)
+
+                    timestamp = self.get_timestamp(line_no)
+                    if timestamp is not None and timestamp <= target_timestamp:
+                        break
+                    line_no -= 1
+
+            if not worker.is_cancelled:
+                def update_ui(target_line: int):
+                    self.pointer_line = target_line
+                    self.scroll_pointer_to_center(animate=abs(initial_line_no - target_line) < 100)
+                self.app.call_from_thread(update_ui, line_no)
+        finally:
+            if seeking_screen is not None:
+                self.app.call_from_thread(seeking_screen.dismiss)
 
     def watch_tail(self, tail: bool) -> None:
         self.set_class(tail, "-tail")
@@ -928,6 +957,9 @@ class LogLines(ScrollView, inherit_bindings=False):
 
         if not self.tail and event.tail:
             self.post_message(PendingLines(len(line_breaks) - self._line_count + 1))
+
+        if event.tail:
+            self._addition_history.append((time.time(), len(event.breaks)))
 
         line_breaks.extend(event.breaks)
         if not event.tail:
@@ -992,3 +1024,31 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._text_cache.discard((log_file, start, end, False))
         self._text_cache.discard((log_file, start, end, True))
         self.refresh_lines(event.index, 1)
+
+    def get_lines_per_second(self) -> float:
+        now = time.time()
+        # Keep only the last 10 seconds of history
+        self._addition_history = [
+            (t, count) for t, count in self._addition_history if now - t <= 10.0
+        ]
+        if not self._addition_history:
+            return 0.0
+        total_lines = sum(count for _, count in self._addition_history)
+        first_t = self._addition_history[0][0]
+        duration = now - first_t
+        if duration < 1.0:
+            return float(total_lines)
+        return total_lines / duration
+
+    def get_last_addition_time(self) -> datetime | None:
+        import os
+        try:
+            mtimes = []
+            for log_file in self.log_files:
+                if log_file.path.exists():
+                    mtimes.append(os.path.getmtime(log_file.path))
+            if mtimes:
+                return datetime.fromtimestamp(max(mtimes))
+        except Exception:
+            pass
+        return None

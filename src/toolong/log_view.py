@@ -224,6 +224,7 @@ class LogFooter(Widget):
         self.watch(self.screen, "focused", self.mount_keys)
         self.watch(self.screen, "stack_updates", self.mount_keys)
         self.call_after_refresh(self.mount_keys)
+        self.set_interval(1.0, self.update_meta)
 
     def update_meta(self) -> None:
         meta: list[str] = []
@@ -233,6 +234,24 @@ class LogFooter(Widget):
             meta.append(f"{self.timestamp:%x %X}")
         if self.line_no is not None:
             meta.append(f"{self.line_no + 1}")
+
+        if self.is_mounted:
+            try:
+                log_lines = self.parent.query_one("LogLines")
+                rate = log_lines.get_lines_per_second()
+                if rate > 0:
+                    if rate.is_integer():
+                        meta.append(f"{int(rate)} lines/s")
+                    else:
+                        meta.append(f"{rate:.1f} lines/s")
+                else:
+                    meta.append("0 lines/s")
+
+                last_add = log_lines.get_last_addition_time()
+                if last_add is not None:
+                    meta.append(f"Last add: {last_add:%Y-%m-%d %H:%M:%S}")
+            except Exception:
+                pass
 
         meta_line = " • ".join(meta)
         self.query_one(".meta", Label).update(meta_line)

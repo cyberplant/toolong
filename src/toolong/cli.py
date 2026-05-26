@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from importlib.metadata import version
+from importlib.metadata import version, PackageNotFoundError
 import os
 import sys
 
@@ -8,9 +8,14 @@ import click
 
 from toolong.ui import UI
 
+try:
+    __version__ = version("toolong")
+except PackageNotFoundError:
+    __version__ = "dev"
+
 
 @click.command()
-@click.version_option(version("toolong"))
+@click.version_option(__version__)
 @click.argument("files", metavar="FILE1 FILE2", nargs=-1)
 @click.option("-m", "--merge", is_flag=True, help="Merge files.")
 @click.option(
