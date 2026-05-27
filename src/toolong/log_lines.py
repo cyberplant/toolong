@@ -225,6 +225,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._lock = RLock()
         self._addition_history: list[tuple[float, int]] = []
         self.scan_percentage: float | None = 0.0
+        self._tail_started = False
 
     @property
     def log_file(self) -> LogFile:
@@ -271,12 +272,22 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._line_reader.start()
         self.initial_scan_worker = self.run_scan(self.app.save_merge)
 
+    def _maybe_start_tail(self) -> None:
+        """Start tailing if supported and not already started. Safe to call multiple times."""
+        if not self._tail_started and self.log_file.can_tail:
+            self._tail_started = True
+            self.start_tail()
+
     def start_tail(self) -> None:
         def size_changed(size: int, breaks: list[int]) -> None:
             """Callback when the file changes size."""
-            with self._lock:
-                for offset, _ in enumerate(breaks, 1):
-                    self.get_line_from_index(self.line_count - offset)
+            # Skip cache prefetch while scanning: _line_breaks is partially built
+            # in reverse order and would produce wrong spans. After scanning
+            # completes (scan_percentage is None) it is safe to prefetch.
+            if self.scan_percentage is None:
+                with self._lock:
+                    for offset, _ in enumerate(breaks, 1):
+                        self.get_line_from_index(self.line_count - offset)
             self.post_message(NewBreaks(self.log_file, breaks, size, tail=True))
             if self.message_queue_size > 10:
                 while self.message_queue_size > 2:
@@ -320,6 +331,11 @@ class LogLines(ScrollView, inherit_bindings=False):
             return
 
         size = self.log_file.size
+
+        # Start the watcher immediately so appended lines are captured while
+        # the (potentially slow) background scan is still running.
+        if self.log_file.can_tail:
+            self.call_from_thread(self._maybe_start_tail)
 
         if not size:
             self.post_message(ScanComplete(0, 0))
@@ -1006,8 +1022,11 @@ class LogLines(ScrollView, inherit_bindings=False):
         self.scan_percentage = None
         self.update_line_count()
         self.refresh()
+        # Ensure the watcher is running. Normally it was started early in
+        # run_scan(), but this acts as a fallback (e.g. empty file, cancelled
+        # scan, or compressed files where can_tail is False).
         if len(self.log_files) == 1 and self.can_tail:
-            self.start_tail()
+            self._maybe_start_tail()
 
     @on(ScanProgress)
     def on_scan_progress(self, event: ScanProgress):
