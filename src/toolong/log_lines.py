@@ -335,7 +335,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         # Start the watcher immediately so appended lines are captured while
         # the (potentially slow) background scan is still running.
         if self.log_file.can_tail:
-            self.call_from_thread(self._maybe_start_tail)
+            self.app.call_from_thread(self._maybe_start_tail)
 
         if not size:
             self.post_message(ScanComplete(0, 0))
