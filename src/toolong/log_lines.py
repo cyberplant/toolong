@@ -139,7 +139,6 @@ class LogLines(ScrollView, inherit_bindings=False):
         Binding("pagedown,space", "page_down", "Page Down", show=False),
         Binding("enter", "select", "Select line", show=False),
         Binding("escape", "dismiss", "Dismiss", show=False, priority=True),
-        Binding("S", "start_scan", "Scan"),
         Binding("m", "navigate(+1, 'm')"),
         Binding("M", "navigate(-1, 'm')"),
         Binding("o", "navigate(+1, 'h')"),
@@ -737,9 +736,10 @@ class LogLines(ScrollView, inherit_bindings=False):
         self.update_virtual_size()
 
     def update_virtual_size(self) -> None:
+        show_line_nos = self.show_line_numbers and self._scan_complete
         self.virtual_size = Size(
             self._max_width
-            + (self.gutter_width if self.show_gutter or self.show_line_numbers else 0),
+            + (self.gutter_width if self.show_gutter or show_line_nos else 0),
             self.line_count,
         )
 
@@ -760,7 +760,7 @@ class LogLines(ScrollView, inherit_bindings=False):
                 continue
             if log_file_span not in self._line_cache:
                 self._line_reader.request_line(log_file, index, start, end)
-        if self.show_line_numbers:
+        if self.show_line_numbers and self._scan_complete:
             max_line_no = self.scroll_offset.y + page_height
             self._gutter_width = len(f"{max_line_no+1} ")
         else:
@@ -827,7 +827,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         else:
             strip = strip.crop_extend(scroll_x, scroll_x + width, None)
 
-        if self.show_gutter or self.show_line_numbers:
+        if self.show_gutter or (self.show_line_numbers and self._scan_complete):
             line_number_style = self.get_component_rich_style(
                 "loglines--line-numbers-active"
                 if index == self.pointer_line
@@ -838,7 +838,7 @@ class LogLines(ScrollView, inherit_bindings=False):
             else:
                 icon = self.icons.get(index, " ")
 
-            if self.show_line_numbers:
+            if self.show_line_numbers and self._scan_complete:
                 segments = [Segment(f"{index+1} ", line_number_style), Segment(icon)]
             else:
                 segments = [Segment(icon)]
@@ -1000,11 +1000,8 @@ class LogLines(ScrollView, inherit_bindings=False):
     def action_scroll_end(self) -> None:
         if self.pointer_line is not None:
             self.pointer_line = self.line_count
-        if self.scroll_offset.y == self.max_scroll_y:
-            self.post_message(TailFile(True))
-        else:
-            self.scroll_to(y=self.max_scroll_y, duration=0)
-            self.post_message(TailFile(False))
+        self.scroll_to(y=self.max_scroll_y, duration=0)
+        self.post_message(TailFile(True))
 
     def action_page_down(self) -> None:
         if self.pointer_line is None:
@@ -1279,7 +1276,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         if self._scan_complete:
             return True
         self.notify(
-            f'"{feature}" requires a complete scan. Press [bold]S[/bold] to start scanning.',
+            f'"{feature}" requires a complete file scan.',
             title="Scan required",
             severity="warning",
         )
