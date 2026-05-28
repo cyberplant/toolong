@@ -25,7 +25,13 @@ except PackageNotFoundError:
     nargs=1,
     help="Path to save merged file (requires -m).",
 )
-def run(files: list[str], merge: bool, output_merge: str) -> None:
+@click.option(
+    "--no-scan",
+    is_flag=True,
+    default=False,
+    help="Skip full file scan. Only the head and tail are loaded on demand.",
+)
+def run(files: list[str], merge: bool, output_merge: str, no_scan: bool) -> None:
     """View / tail / search log files."""
     stdin_tty = sys.__stdin__.isatty()
     if not files and stdin_tty:
@@ -34,7 +40,7 @@ def run(files: list[str], merge: bool, output_merge: str) -> None:
         ctx.exit()
     if stdin_tty:
         try:
-            ui = UI(files, merge=merge, save_merge=output_merge)
+            ui = UI(files, merge=merge, save_merge=output_merge, scan=not no_scan)
             ui.run()
         except Exception:
             pass

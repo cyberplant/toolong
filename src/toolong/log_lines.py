@@ -139,6 +139,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         Binding("pagedown,space", "page_down", "Page Down", show=False),
         Binding("enter", "select", "Select line", show=False),
         Binding("escape", "dismiss", "Dismiss", show=False, priority=True),
+        Binding("S", "start_scan", "Scan"),
         Binding("m", "navigate(+1, 'm')"),
         Binding("M", "navigate(-1, 'm')"),
         Binding("o", "navigate(+1, 'h')"),
@@ -194,11 +195,13 @@ class LogLines(ScrollView, inherit_bindings=False):
     pointer_line: reactive[int | None] = reactive(None, repaint=False)
     is_scrolling: reactive[int] = reactive(int)
     pending_lines: reactive[int] = reactive(int)
-    tail: reactive[bool] = reactive(True)
+    tail: reactive[bool] = reactive(False)
     can_tail: reactive[bool] = reactive(True)
     show_line_numbers: reactive[bool] = reactive(False)
 
-    def __init__(self, watcher: WatcherBase, file_paths: list[str]) -> None:
+    def __init__(
+        self, watcher: WatcherBase, file_paths: list[str], scan: bool = True
+    ) -> None:
         super().__init__()
         self.watcher = watcher
         self.file_paths = file_paths
@@ -224,6 +227,12 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._merge_lines: list[tuple[float, int, LogFile]] | None = None
         self._lock = RLock()
         self._addition_history: list[tuple[float, int]] = []
+        self._tail_breaks: dict[LogFile, list[int]] = {}
+        self._head_frontier = 0
+        self._tail_frontier = 0
+        self._tail_scan_active = False
+        self._scan_complete = False
+        self._scan_enabled = scan
         self.scan_percentage: float | None = 0.0
         self._tail_started = False
 
@@ -253,6 +262,7 @@ class LogLines(ScrollView, inherit_bindings=False):
     def clear_caches(self) -> None:
         self._line_cache.clear()
         self._text_cache.clear()
+        self._render_line_cache.clear()
 
     def notify_style_update(self) -> None:
         self.clear_caches()
@@ -270,7 +280,10 @@ class LogLines(ScrollView, inherit_bindings=False):
         self.loading = False
         self.add_class("-scanning")
         self._line_reader.start()
-        self.initial_scan_worker = self.run_scan(self.app.save_merge)
+        if self._scan_enabled:
+            self.initial_scan_worker = self.run_scan(self.app.save_merge)
+        else:
+            self.initial_scan_worker = self._quick_open()
 
     def _maybe_start_tail(self) -> None:
         """Start tailing if supported and not already started. Safe to call multiple times."""
@@ -337,24 +350,136 @@ class LogLines(ScrollView, inherit_bindings=False):
         if self.log_file.can_tail:
             self.app.call_from_thread(self._maybe_start_tail)
 
+        # Set scan start to 0 — forward scan always starts at the beginning
+        self._scan_start = 0
+        self._head_frontier = 0
+
         if not size:
             self.post_message(ScanComplete(0, 0))
             return
 
-        position = size
+        position = 0
         line_count = 0
 
-        for position, breaks in self.log_file.scan_line_breaks():
+        for position, breaks in self.log_file.scan_line_breaks_forward():
             line_count_thousands = line_count // 1000
-            message = f"Scanning… ({line_count_thousands:,}K lines)- ESCAPE to cancel"
-
-            self.post_message(ScanProgress(message, 1 - (position / size), position))
+            message = f"Scanning… ({line_count_thousands:,}K lines) - ESCAPE to cancel"
+            self.post_message(ScanProgress(message, position / size))
             if breaks:
-                self.post_message(NewBreaks(self.log_file, breaks))
+                self.post_message(
+                    NewBreaks(
+                        self.log_file,
+                        breaks,
+                        scanned_size=position,
+                        from_head=True,
+                    )
+                )
                 line_count += len(breaks)
             if worker.is_cancelled:
                 break
-        self.post_message(ScanComplete(size, position))
+        self.post_message(ScanComplete(size, 0))
+
+    @work(thread=True)
+    def _quick_open(self) -> None:
+        """Open the file and scan only the first chunk (--no-scan mode)."""
+        INITIAL_BYTES = 256 * 1024
+        worker = get_current_worker()
+
+        if len(self.log_files) > 1:
+            self.merge_log_files()
+            self.scan_percentage = None
+            self.app.call_from_thread(self.remove_class, "-scanning")
+            return
+
+        try:
+            if not self.log_file.open(worker.cancelled_event):
+                self.loading = False
+                self.app.call_from_thread(self.remove_class, "-scanning")
+                return
+        except FileNotFoundError:
+            self.notify(f"File {self.log_file.path.name!r} not found.", severity="error")
+            self.loading = False
+            self.app.call_from_thread(self.remove_class, "-scanning")
+            return
+        except Exception as error:
+            self.notify(
+                f"Failed to open {self.log_file.path.name!r}; {error}", severity="error"
+            )
+            self.loading = False
+            self.app.call_from_thread(self.remove_class, "-scanning")
+            return
+
+        self._scan_start = 0
+        self._head_frontier = 0
+
+        if self.log_file.can_tail:
+            self.app.call_from_thread(self._maybe_start_tail)
+
+        size = self.log_file.size
+        if not size:
+            self.scan_percentage = None
+            self.update_line_count()
+            self.app.call_from_thread(self.remove_class, "-scanning")
+            return
+
+        for position, breaks in self.log_file.scan_line_breaks_forward():
+            if worker.is_cancelled:
+                break
+            if breaks:
+                self.post_message(
+                    NewBreaks(
+                        self.log_file,
+                        breaks,
+                        scanned_size=position,
+                        from_head=True,
+                    )
+                )
+            if position >= INITIAL_BYTES:
+                break
+
+        self.scan_percentage = None
+        self.app.call_from_thread(self.remove_class, "-scanning")
+
+    @work(thread=True)
+    def _scan_tail_on_demand(self) -> None:
+        """Reverse-scan from EOF toward the head frontier to build tail breaks."""
+        TAIL_SCAN_BYTES = 5 * 1024 * 1024
+        worker = get_current_worker()
+        log_file = self.log_file
+
+        if not log_file.is_open or not log_file.can_tail:
+            return
+
+        size = log_file.size
+        stop_at = max(self._head_frontier, size - TAIL_SCAN_BYTES)
+        self._tail_frontier = stop_at
+
+        for position, breaks in log_file.scan_line_breaks(stop_at=stop_at):
+            if worker.is_cancelled:
+                break
+            if breaks:
+                self.post_message(
+                    NewBreaks(log_file, breaks, scanned_size=size, from_tail_scan=True)
+                )
+
+    def _merge_head_tail(self, log_file: LogFile) -> None:
+        """Merge head and tail break lists when the forward scan has caught up."""
+        import heapq
+
+        head = self._line_breaks.get(log_file, [])
+        tail = self._tail_breaks.pop(log_file, [])
+        merged: list[int] = []
+        seen: set[int] = set()
+        for x in heapq.merge(head, tail):
+            if x not in seen:
+                seen.add(x)
+                merged.append(x)
+        self._line_breaks[log_file] = merged
+        self._scanned_size = max(self._scanned_size, log_file.size)
+        self._tail_scan_active = False
+        self.update_line_count()
+        self.clear_caches()
+        self.refresh()
 
     def merge_log_files(self) -> None:
         worker = get_current_worker()
@@ -480,17 +605,41 @@ class LogLines(ScrollView, inherit_bindings=False):
 
     def index_to_span(self, index: int) -> tuple[LogFile, int, int]:
         log_file, index = self.get_log_file_from_index(index)
-        line_breaks = self._line_breaks.setdefault(log_file, [])
-        scan_start = 0 if self._merge_lines else self._scan_start
-        if not line_breaks:
-            return (log_file, scan_start, self._scan_start)
-        index = clamp(index, 0, len(line_breaks))
+        head_breaks = self._line_breaks.setdefault(log_file, [])
+        tail_breaks = self._tail_breaks.get(log_file)
+        n_head = len(head_breaks)
+
+        if tail_breaks is not None:
+            n_tail = len(tail_breaks)
+            gap_index = n_head
+
+            if index < n_head:
+                if n_head == 0:
+                    return (log_file, 0, 0)
+                index = clamp(index, 0, n_head - 1)
+                if index == 0:
+                    return (log_file, 0, head_breaks[0])
+                return (log_file, head_breaks[index - 1], head_breaks[index])
+            elif index == gap_index:
+                return (log_file, -1, -1)
+            else:
+                j = index - gap_index - 1
+                if n_tail == 0:
+                    return (log_file, self._tail_frontier, self._tail_frontier)
+                j = clamp(j, 0, n_tail - 1)
+                if j == 0:
+                    return (log_file, self._tail_frontier, tail_breaks[0])
+                return (log_file, tail_breaks[j - 1], tail_breaks[j])
+
+        if not head_breaks:
+            return (log_file, 0, 0)
+        index = clamp(index, 0, len(head_breaks))
         if index == 0:
-            return (log_file, scan_start, line_breaks[0])
-        start = line_breaks[index - 1]
+            return (log_file, 0, head_breaks[0])
+        start = head_breaks[index - 1]
         end = (
-            line_breaks[index]
-            if index < len(line_breaks)
+            head_breaks[index]
+            if index < len(head_breaks)
             else max(0, self._scanned_size - 1)
         )
         return (log_file, start, end)
@@ -498,11 +647,15 @@ class LogLines(ScrollView, inherit_bindings=False):
     def get_line_from_index_blocking(self, index: int) -> str | None:
         with self._lock:
             log_file, start, end = self.index_to_span(index)
+            if start == -1:
+                return None
             return log_file.get_line(start, end)
 
     def get_line_from_index(self, index: int) -> str | None:
         with self._lock:
             log_file, start, end = self.index_to_span(index)
+            if start == -1:
+                return None
             return self.get_line(log_file, index, start, end)
 
     def _get_line(self, log_file: LogFile, start: int, end: int) -> str:
@@ -540,6 +693,8 @@ class LogLines(ScrollView, inherit_bindings=False):
         max_line_length=MAX_LINE_LENGTH,
     ) -> tuple[str, Text, datetime | None]:
         log_file, start, end = self.index_to_span(line_index)
+        if start == -1:
+            return "", Text(""), None
         cache_key = (log_file, start, end, abbreviate)
         try:
             line, text, timestamp = self._text_cache[cache_key]
@@ -568,6 +723,8 @@ class LogLines(ScrollView, inherit_bindings=False):
             A datetime or `None`.
         """
         log_file, start, end = self.index_to_span(line_index)
+        if start == -1:
+            return None
         line = log_file.get_line(start, end)
         timestamp = log_file.timestamp_scanner.scan(line)
         return timestamp
@@ -598,9 +755,11 @@ class LogLines(ScrollView, inherit_bindings=False):
             min(line_count, scroll_y + page_height + page_height),
         ):
             log_file_span = index_to_span(index)
+            log_file, start, end = log_file_span
+            if start == -1:
+                continue
             if log_file_span not in self._line_cache:
-                log_file, *span = log_file_span
-                self._line_reader.request_line(log_file, index, *span)
+                self._line_reader.request_line(log_file, index, start, end)
         if self.show_line_numbers:
             max_line_no = self.scroll_offset.y + page_height
             self._gutter_width = len(f"{max_line_no+1} ")
@@ -620,9 +779,16 @@ class LogLines(ScrollView, inherit_bindings=False):
             return Strip.blank(width, style)
 
         log_file_span = self.index_to_span(index)
+        log_file, start, end = log_file_span
+        if start == -1:
+            dim = Style(dim=True)
+            bar = "─" * max(0, (width - 16) // 2)
+            text = Text(f"{bar} Scanning… {bar}", style=dim)
+            text.stylize_before(style)
+            return Strip(text.render(self.app.console), width)
 
         is_pointer = self.pointer_line is not None and index == self.pointer_line
-        cache_key = (*log_file_span, is_pointer, self.find)
+        cache_key = (log_file, start, end, is_pointer, self.find)
 
         try:
             strip = self._render_line_cache[cache_key]
@@ -754,6 +920,8 @@ class LogLines(ScrollView, inherit_bindings=False):
             with self._lock:
                 for line_no in line_range:
                     log_file, start, end = index_to_span(line_no)
+                    if start == -1:
+                        continue
                     line = log_file.get_raw(start, end).decode(
                         "utf-8", errors="replace"
                     )
@@ -882,8 +1050,36 @@ class LogLines(ScrollView, inherit_bindings=False):
         else:
             self.post_message(DismissOverlay())
 
+    def action_start_scan(self) -> None:
+        """Start a full scan if not already running."""
+        if self._scan_complete:
+            return
+        if self.initial_scan_worker is not None and self.initial_scan_worker.is_running:
+            return
+        self._scan_enabled = True
+        self.add_class("-scanning")
+        self.scan_percentage = 0.0
+        self._tail_scan_active = False
+        self._tail_frontier = 0
+        self._head_frontier = 0
+        self._scan_complete = False
+        self._tail_breaks.clear()
+        self._line_breaks.clear()
+        self._line_cache.clear()
+        self._text_cache.clear()
+        self._render_line_cache.clear()
+        self._line_count = 0
+        self._scanned_size = 0
+        if self.log_file.is_open:
+            self.log_file.close()
+        self.update_line_count()
+        self.refresh()
+        self.initial_scan_worker = self.run_scan()
+
     @work(thread=True)
     def action_navigate(self, steps: int, unit: Literal["m", "h", "d"]) -> None:
+        if not self._require_scan("Time navigation"):
+            return
         worker = get_current_worker()
         initial_line_no = line_no = (
             self.scroll_offset.y if self.pointer_line is None else self.pointer_line
@@ -957,30 +1153,94 @@ class LogLines(ScrollView, inherit_bindings=False):
         if tail:
             self.update_line_count()
             self.scroll_to(y=self.max_scroll_y, animate=False)
-            if tail:
-                self.pointer_line = None
+            self.pointer_line = None
+            if (
+                not self._tail_scan_active
+                and not self._scan_complete
+                and len(self.log_files) == 1
+                and self.log_file.can_tail
+                and self.log_file.size > 0
+            ):
+                self._tail_scan_active = True
+                self._tail_breaks.setdefault(self.log_file, [])
+                self._scan_tail_on_demand()
 
     def update_line_count(self) -> None:
-        line_count = len(self._line_breaks.get(self.log_file, []))
-        line_count = max(1, line_count)
-        self._line_count = line_count
+        head_breaks = self._line_breaks.get(self.log_file, [])
+        tail_breaks = self._tail_breaks.get(self.log_file)
+        if tail_breaks is not None:
+            count = len(head_breaks) + 1 + len(tail_breaks)
+        else:
+            count = len(head_breaks)
+        self._line_count = max(1, count)
 
     @on(NewBreaks)
     def on_new_breaks(self, event: NewBreaks) -> None:
-        line_breaks = self._line_breaks.setdefault(event.log_file, [])
-        first = not line_breaks
         event.stop()
-        self._scanned_size = max(self._scanned_size, event.scanned_size)
+        log_file = event.log_file
 
-        if not self.tail and event.tail:
-            self.post_message(PendingLines(len(line_breaks) - self._line_count + 1))
+        if event.from_tail_scan:
+            tail_breaks = self._tail_breaks.setdefault(log_file, [])
+            tail_breaks.extend(event.breaks)
+            tail_breaks.sort()
+            if self._head_frontier >= self._tail_frontier and self._tail_frontier > 0:
+                self._merge_head_tail(log_file)
+                return
+            self.update_line_count()
+            self.loading = False
+            if self.tail:
+                self.update_virtual_size()
+                self.scroll_to(y=self.max_scroll_y, animate=False, force=True)
+            return
 
         if event.tail:
             self._addition_history.append((time.time(), len(event.breaks)))
+            self._scanned_size = max(self._scanned_size, event.scanned_size)
+
+            if not self._scan_complete and len(self.log_files) == 1 and log_file.can_tail:
+                if not self._tail_scan_active:
+                    self._tail_scan_active = True
+                    self._tail_breaks.setdefault(log_file, [])
+                    self._scan_tail_on_demand()
+                self._tail_breaks[log_file].extend(event.breaks)
+            else:
+                line_breaks = self._line_breaks.setdefault(log_file, [])
+                line_breaks.extend(event.breaks)
+
+            if not self.tail:
+                tail_breaks = self._tail_breaks.get(log_file)
+                pending_count = (
+                    len(tail_breaks)
+                    if tail_breaks is not None
+                    else len(self._line_breaks.get(log_file, []))
+                ) - self._line_count + 1
+                if pending_count > 0:
+                    self.post_message(PendingLines(pending_count))
+
+            self.loading = False
+            if self.tail:
+                self.update_line_count()
+                self.update_virtual_size()
+                self.scroll_to(y=self.max_scroll_y, animate=False, force=True)
+            return
+
+        line_breaks = self._line_breaks.setdefault(log_file, [])
+        first = not line_breaks
+        self._scanned_size = max(self._scanned_size, event.scanned_size)
 
         line_breaks.extend(event.breaks)
-        if not event.tail:
+        if not event.from_head:
             line_breaks.sort()
+
+        if event.from_head and event.scanned_size > self._head_frontier:
+            self._head_frontier = event.scanned_size
+            if (
+                log_file in self._tail_breaks
+                and self._tail_frontier > 0
+                and self._head_frontier >= self._tail_frontier
+            ):
+                self._merge_head_tail(log_file)
+                return
 
         pointer_distance_from_end = (
             None
@@ -989,8 +1249,7 @@ class LogLines(ScrollView, inherit_bindings=False):
         )
         self.loading = False
 
-        if not event.tail or self.tail or first:
-            self.update_line_count()
+        self.update_line_count()
 
         if self.tail:
             if self.pointer_line is not None and pointer_distance_from_end is not None:
@@ -1015,16 +1274,29 @@ class LogLines(ScrollView, inherit_bindings=False):
     def on_scroll(self, event: events.Event) -> None:
         self.post_message(TailFile(False))
 
+    def _require_scan(self, feature: str) -> bool:
+        """Return True if a full scan is available; otherwise notify and return False."""
+        if self._scan_complete:
+            return True
+        self.notify(
+            f'"{feature}" requires a complete scan. Press [bold]S[/bold] to start scanning.',
+            title="Scan required",
+            severity="warning",
+        )
+        return False
+
     @on(ScanComplete)
     def on_scan_complete(self, event: ScanComplete) -> None:
         self._scanned_size = max(self._scanned_size, event.size)
         self._scan_start = event.scan_start
+        self._head_frontier = max(self._head_frontier, event.size)
+        self._scan_complete = True
         self.scan_percentage = None
         self.update_line_count()
         self.refresh()
-        # Ensure the watcher is running. Normally it was started early in
-        # run_scan(), but this acts as a fallback (e.g. empty file, cancelled
-        # scan, or compressed files where can_tail is False).
+        log_file = self.log_file
+        if len(self.log_files) == 1 and log_file in self._tail_breaks:
+            self._merge_head_tail(log_file)
         if len(self.log_files) == 1 and self.can_tail:
             self._maybe_start_tail()
 

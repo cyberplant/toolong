@@ -207,6 +207,7 @@ class LogFooter(Widget):
                     if binding.show
                 ]
 
+                log_lines = self.parent.query_one(LogLines)
                 await key_container.mount_all(
                     [
                         FooterKey(
@@ -215,8 +216,10 @@ class LogFooter(Widget):
                             binding.description,
                         )
                         for binding in bindings
-                        if binding.action != "toggle_tail"
-                        or (binding.action == "toggle_tail" and self.can_tail)
+                        if (
+                            (binding.action != "toggle_tail" or self.can_tail)
+                            and (binding.action != "start_scan" or not log_lines._scan_complete)
+                        )
                     ]
                 )
 
@@ -307,20 +310,25 @@ class LogView(Horizontal):
     show_find: reactive[bool] = reactive(False)
     show_panel: reactive[bool] = reactive(False)
     show_line_numbers: reactive[bool] = reactive(False)
-    tail: reactive[bool] = reactive(True)
+    tail: reactive[bool] = reactive(False)
     can_tail: reactive[bool] = reactive(True)
 
     def __init__(
-        self, file_paths: list[str], watcher: WatcherBase, can_tail: bool = True
+        self,
+        file_paths: list[str],
+        watcher: WatcherBase,
+        can_tail: bool = True,
+        scan: bool = True,
     ) -> None:
         self.file_paths = file_paths
         self.watcher = watcher
+        self.scan = scan
         super().__init__()
         self.can_tail = can_tail
 
     def compose(self) -> ComposeResult:
         yield (
-            log_lines := LogLines(self.watcher, self.file_paths).data_bind(
+            log_lines := LogLines(self.watcher, self.file_paths, scan=self.scan).data_bind(
                 LogView.tail,
                 LogView.show_line_numbers,
                 LogView.show_find,
@@ -462,6 +470,12 @@ class LogView(Horizontal):
         self.action_goto()
 
     def action_goto(self) -> None:
+        log_lines = self.query_one(LogLines)
+        if not log_lines._require_scan("Go to line"):
+            return
         from toolong.goto_screen import GotoScreen
 
-        self.app.push_screen(GotoScreen(self.query_one(LogLines)))
+        self.app.push_screen(GotoScreen(log_lines))
+
+    def action_start_scan(self) -> None:
+        self.query_one(LogLines).action_start_scan()

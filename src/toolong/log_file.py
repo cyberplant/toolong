@@ -158,7 +158,7 @@ class LogFile:
         )
 
     def scan_line_breaks(
-        self, batch_time: float = 0.25
+        self, batch_time: float = 0.25, stop_at: int = 0
     ) -> Iterable[tuple[int, list[int]]]:
         """Scan the file for line breaks.
 
@@ -185,17 +185,53 @@ class LogFile:
             monotonic = time.monotonic
             break_time = monotonic()
 
-            if log_mmap[-1] != "\n":
+            if log_mmap[-1] != ord("\n"):
                 batch.append(position)
 
-            while (position := rfind(b"\n", 0, position)) != -1:
+            while (position := rfind(b"\n", stop_at, position)) != -1:
                 append(position)
                 if get_length() % 1000 == 0 and monotonic() - break_time > batch_time:
                     break_time = monotonic()
                     yield (position, batch)
                     batch = []
                     append = batch.append
-            yield (0, batch)
+                    get_length = batch.__len__
+            yield (stop_at, batch)
+        finally:
+            log_mmap.close()
+
+    def scan_line_breaks_forward(
+        self, batch_time: float = 0.25
+    ) -> Iterable[tuple[int, list[int]]]:
+        fileno = self.fileno
+        size = self.size
+        if not size:
+            return
+        if IS_WINDOWS:
+            log_mmap = mmap.mmap(fileno, size, access=mmap.ACCESS_READ)
+        else:
+            log_mmap = mmap.mmap(fileno, size, prot=mmap.PROT_READ)
+        try:
+            find = log_mmap.find
+            position = 0
+            batch: list[int] = []
+            append = batch.append
+            get_length = batch.__len__
+            monotonic = time.monotonic
+            break_time = monotonic()
+            while (next_pos := find(b"\n", position)) != -1:
+                append(next_pos)
+                position = next_pos + 1
+                if get_length() % 1000 == 0 and monotonic() - break_time > batch_time:
+                    break_time = monotonic()
+                    yield (position, batch)
+                    batch = []
+                    append = batch.append
+                    get_length = batch.__len__
+            if position < size:
+                append(size)
+            if batch:
+                yield (size, batch)
         finally:
             log_mmap.close()
 
