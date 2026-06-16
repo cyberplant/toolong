@@ -207,6 +207,7 @@ class LogFooter(Widget):
                     if binding.show
                 ]
 
+                log_lines = self.parent.query_one(LogLines)
                 await key_container.mount_all(
                     [
                         FooterKey(
@@ -215,8 +216,10 @@ class LogFooter(Widget):
                             binding.description,
                         )
                         for binding in bindings
-                        if binding.action != "toggle_tail"
-                        or (binding.action == "toggle_tail" and self.can_tail)
+                        if (
+                            (binding.action != "toggle_tail" or self.can_tail)
+                            and (binding.action != "start_scan" or not log_lines._scan_complete)
+                        )
                     ]
                 )
 
@@ -224,6 +227,7 @@ class LogFooter(Widget):
         self.watch(self.screen, "focused", self.mount_keys)
         self.watch(self.screen, "stack_updates", self.mount_keys)
         self.call_after_refresh(self.mount_keys)
+        self.set_interval(1.0, self.update_meta)
 
     def update_meta(self) -> None:
         meta: list[str] = []
@@ -233,6 +237,28 @@ class LogFooter(Widget):
             meta.append(f"{self.timestamp:%x %X}")
         if self.line_no is not None:
             meta.append(f"{self.line_no + 1}")
+
+        if self.is_mounted:
+            try:
+                log_lines = self.parent.query_one("LogLines")
+                if log_lines.scan_percentage is not None:
+                    percent = int(log_lines.scan_percentage * 100)
+                    meta.append(f"Scanning… {percent}%")
+
+                rate = log_lines.get_lines_per_second()
+                if rate > 0:
+                    if rate.is_integer():
+                        meta.append(f"{int(rate)} lines/s")
+                    else:
+                        meta.append(f"{rate:.1f} lines/s")
+                else:
+                    meta.append("0 lines/s")
+
+                last_add = log_lines.get_last_addition_time()
+                if last_add is not None:
+                    meta.append(f"Last add: {last_add:%Y-%m-%d %H:%M:%S}")
+            except Exception:
+                pass
 
         meta_line = " • ".join(meta)
         self.query_one(".meta", Label).update(meta_line)
@@ -288,16 +314,21 @@ class LogView(Horizontal):
     can_tail: reactive[bool] = reactive(True)
 
     def __init__(
-        self, file_paths: list[str], watcher: WatcherBase, can_tail: bool = True
+        self,
+        file_paths: list[str],
+        watcher: WatcherBase,
+        can_tail: bool = True,
+        scan: bool = True,
     ) -> None:
         self.file_paths = file_paths
         self.watcher = watcher
+        self.scan = scan
         super().__init__()
         self.can_tail = can_tail
 
     def compose(self) -> ComposeResult:
         yield (
-            log_lines := LogLines(self.watcher, self.file_paths).data_bind(
+            log_lines := LogLines(self.watcher, self.file_paths, scan=self.scan).data_bind(
                 LogView.tail,
                 LogView.show_line_numbers,
                 LogView.show_find,
@@ -404,18 +435,13 @@ class LogView(Horizontal):
     @on(ScanProgress)
     def on_scan_progress(self, event: ScanProgress):
         event.stop()
-        scan_progress_bar = self.query_one(ScanProgressBar)
-        scan_progress_bar.message = event.message
-        scan_progress_bar.complete = event.complete
 
     @on(ScanComplete)
     async def on_scan_complete(self, event: ScanComplete) -> None:
-        self.query_one(ScanProgressBar).remove()
         log_lines = self.query_one(LogLines)
         log_lines.loading = False
         self.query_one("LogLines").remove_class("-scanning")
         self.post_message(PointerMoved(log_lines.pointer_line))
-        self.tail = True
 
         footer = self.query_one(LogFooter)
         footer.call_after_refresh(footer.mount_keys)
@@ -444,6 +470,12 @@ class LogView(Horizontal):
         self.action_goto()
 
     def action_goto(self) -> None:
+        log_lines = self.query_one(LogLines)
+        if not log_lines._require_scan("Go to line"):
+            return
         from toolong.goto_screen import GotoScreen
 
-        self.app.push_screen(GotoScreen(self.query_one(LogLines)))
+        self.app.push_screen(GotoScreen(log_lines))
+
+    def action_start_scan(self) -> None:
+        self.query_one(LogLines).action_start_scan()

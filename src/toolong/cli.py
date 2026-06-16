@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from importlib.metadata import version
+from importlib.metadata import version, PackageNotFoundError
 import os
 import sys
 
@@ -8,9 +8,14 @@ import click
 
 from toolong.ui import UI
 
+try:
+    __version__ = version("toolong")
+except PackageNotFoundError:
+    __version__ = "dev"
+
 
 @click.command()
-@click.version_option(version("toolong"))
+@click.version_option(__version__)
 @click.argument("files", metavar="FILE1 FILE2", nargs=-1)
 @click.option("-m", "--merge", is_flag=True, help="Merge files.")
 @click.option(
@@ -20,7 +25,13 @@ from toolong.ui import UI
     nargs=1,
     help="Path to save merged file (requires -m).",
 )
-def run(files: list[str], merge: bool, output_merge: str) -> None:
+@click.option(
+    "--no-scan",
+    is_flag=True,
+    default=False,
+    help="Skip full file scan. Only the head and tail are loaded on demand.",
+)
+def run(files: list[str], merge: bool, output_merge: str, no_scan: bool) -> None:
     """View / tail / search log files."""
     stdin_tty = sys.__stdin__.isatty()
     if not files and stdin_tty:
@@ -29,7 +40,7 @@ def run(files: list[str], merge: bool, output_merge: str) -> None:
         ctx.exit()
     if stdin_tty:
         try:
-            ui = UI(files, merge=merge, save_merge=output_merge)
+            ui = UI(files, merge=merge, save_merge=output_merge, scan=not no_scan)
             ui.run()
         except Exception:
             pass
